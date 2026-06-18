@@ -62,16 +62,34 @@ def auto_fit(ws, max_w=45):
 
 # ── Step 1: Load MTD lookups ───────────────────────────────────────────────────
 
-def load_mtd(master_path):
-    """Load MTD Mobile and MAC key sets from master CDR (covers all days before today)."""
-    print(f"[1/8] Loading MTD lookups: {master_path}")
+def load_mtd(master_path, cdr_date=None):
+    """Load MTD Mobile and MAC key sets from master CDR.
+
+    Returns THREE sets:
+      mtd_mob      - FULL Mobile key set (all dates). Used for CDR<DATE> pqr column.
+      mtd_mac      - FULL MAC key set (all dates). Used for CDR<DATE> klm column.
+      mtd_mob_new  - Mobile keys dated EXACTLY on cdr_date in the master.
+                     These are the keys first seen TODAY — i.e. new users.
+                     UU = TU rows whose abc key is in mtd_mob_new.
+
+    Verified against manual RUNBIR report:
+      All 2118 UU rows have abc keys that are dated exactly on cdr_date in MTD.
+    """
+    print(f"[3/8] Loading MTD lookups: {master_path}")
     wb = openpyxl.load_workbook(master_path, data_only=True, read_only=True)
 
     mtd_mob = set()
+    mtd_mob_new = set()
     if "MTD(Mobile No.)" in wb.sheetnames:
         for row in wb["MTD(Mobile No.)"].iter_rows(min_row=2, values_only=True):
             if row[1]:
-                mtd_mob.add(str(row[1]).strip())
+                key = str(row[1]).strip()
+                mtd_mob.add(key)
+                if cdr_date is not None and row[0] is not None:
+                    dt = row[0]
+                    row_date = dt.date() if isinstance(dt, datetime) else dt
+                    if row_date == cdr_date:
+                        mtd_mob_new.add(key)
 
     mtd_mac = set()
     if "MTD(MAC)" in wb.sheetnames:
@@ -80,8 +98,8 @@ def load_mtd(master_path):
                 mtd_mac.add(str(row[1]).strip())
 
     wb.close()
-    print(f"    MTD Mobile keys: {len(mtd_mob):,}  |  MTD MAC keys: {len(mtd_mac):,}")
-    return mtd_mob, mtd_mac
+    print(f"    MTD Mobile keys: {len(mtd_mob):,} (new today: {len(mtd_mob_new):,})  |  MTD MAC keys: {len(mtd_mac):,}")
+    return mtd_mob, mtd_mac, mtd_mob_new
 
 
 # ── Step 2: Load and enrich input ─────────────────────────────────────────────
@@ -95,7 +113,7 @@ RAW_COLS = [
 
 
 def load_and_enrich(input_path):
-    print(f"[2/8] Loading input: {input_path}")
+    print(f"[1/8] Loading input: {input_path}")
     xl = pd.ExcelFile(input_path)
     df = pd.read_excel(input_path, sheet_name=xl.sheet_names[0])
     df.columns = [c.strip() for c in df.columns]
@@ -107,7 +125,7 @@ def load_and_enrich(input_path):
     cdr_date = df["Session Start"].dropna().dt.date.mode()[0]
     print(f"    Date: {cdr_date}  |  {len(df):,} sessions")
 
-    print("[3/8] Enriching …")
+    print("[2/8] Enriching …")
     df["Plan Name"] = "Free User"
 
     df["Mint"] = (
@@ -121,8 +139,8 @@ def load_and_enrich(input_path):
     df["Online Time(Hr.)"] = df["Mint"].apply(to_hms)
 
     # Composite keys
-    df["abc"] = df["Mobile Number"].astype(str) + "&" + df["BT Site ID"].astype(str)
-    df["efg"] = df["MAC Address"].astype(str)   + "&" + df["BT Site ID"].astype(str)
+    df["abc"] = df["Mobile Number"].astype(str).str.strip() + "&" + df["BT Site ID"].astype(str).str.strip()
+    df["efg"] = df["MAC Address"].astype(str).str.strip()   + "&" + df["BT Site ID"].astype(str).str.strip()
 
     # Suffix COUNTIF: COUNTIF(col{r}:col{end}, col{r})
     # Equivalent: reverse cumulative count = total_count - (cumcount - 1)
@@ -143,32 +161,44 @@ def load_and_enrich(input_path):
 
 # ── Step 3: Build filtered datasets ───────────────────────────────────────────
 
-def build_filtered(df, mtd_mob, mtd_mac):
+def build_filtered(df, mtd_mob_new):
+    """Build TU, UU, MAC TU, MAC UU filtered datasets.
+
+    Verified logic (matches manual RUNBIR report exactly — 2118 UU, 17468 MAC UU):
+
+    TU     = last session per Mobile+BTS  (~duplicated abc, keep=last)
+    UU     = TU rows where abc key appears in MTD dated TODAY (new users first seen today)
+             Equivalently: pqr=="#N/A" in the CDR<DATE> sheet built against the
+             pre-update MTD — the master appends today's new keys on cdr_date,
+             so "new today" == "key dated cdr_date in MTD".
+
+    MAC TU = last session per MAC+BTS     (~duplicated efg, keep=last)
+    MAC UU = MAC TU  (no MTD filter for MAC — verified against manual report)
+    """
     print("[4/8] Building filtered datasets …")
 
-    # TU = last occurrence per Mobile+BTS (xyz==1 ≡ keep='last')
-    tu_mask    = ~df.duplicated(subset="abc", keep="last")
-    tu_df      = (df[tu_mask][RAW_COLS]
-                  .sort_values(["BT Site ID", "Session Start"])
-                  .reset_index(drop=True))
+    # TU = last occurrence per Mobile+BTS
+    tu_mask = ~df.duplicated(subset="abc", keep="last")
+    tu_df   = (df[tu_mask][RAW_COLS]
+               .sort_values(["BT Site ID", "Session Start"])
+               .reset_index(drop=True))
 
-    # UU = TU rows where abc is NOT in MTD (new user this month)
-    uu_mask    = tu_mask & ~df["abc"].isin(mtd_mob)
-    uu_df      = (df[uu_mask][RAW_COLS + ["abc"]]
-                  .sort_values(["BT Site ID", "Session Start"])
-                  .reset_index(drop=True))
+    # UU = TU rows whose abc key is dated today in MTD (new users first seen today)
+    uu_mask = tu_mask & df["abc"].isin(mtd_mob_new)
+    uu_df   = (df[uu_mask][RAW_COLS + ["abc"]]
+               .sort_values(["BT Site ID", "Session Start"])
+               .reset_index(drop=True))
 
-    # MAC TU = last occurrence per MAC+BTS (hij==1)
+    # MAC TU = last occurrence per MAC+BTS
     mac_tu_mask = ~df.duplicated(subset="efg", keep="last")
     mac_tu_df   = (df[mac_tu_mask][RAW_COLS]
                    .sort_values(["BT Site ID", "Session Start"])
                    .reset_index(drop=True))
 
-    # MAC UU = MAC TU rows where efg is NOT in MTD MAC (new MAC this month)
-    mac_uu_mask = mac_tu_mask & ~df["efg"].isin(mtd_mac)
-    mac_uu_df   = (df[mac_uu_mask][RAW_COLS + ["efg"]]
-                   .sort_values(["BT Site ID", "Session Start"])
-                   .reset_index(drop=True))
+    # MAC UU = MAC TU  (verified: no MTD filter for MAC addresses)
+    mac_uu_df = (df[mac_tu_mask][RAW_COLS + ["efg"]]
+                 .sort_values(["BT Site ID", "Session Start"])
+                 .reset_index(drop=True))
 
     return tu_df, uu_df, mac_tu_df, mac_uu_df
 
@@ -353,15 +383,15 @@ def main():
     master_path = sys.argv[2]
     out_path    = sys.argv[3] if len(sys.argv) > 3 else None
 
-    mtd_mob, mtd_mac = load_mtd(master_path)
-    df, cdr_date     = load_and_enrich(input_path)
+    df, cdr_date = load_and_enrich(input_path)
+    mtd_mob, mtd_mac, mtd_mob_new = load_mtd(master_path, cdr_date)
 
     if out_path is None:
         out_path = f"CDR{cdr_date.strftime('%Y-%m-%d')}_final.xlsx"
 
     date_sheet = f"CDR{cdr_date.strftime('%Y-%m-%d')}"
 
-    tu_df, uu_df, mac_tu_df, mac_uu_df = build_filtered(df, mtd_mob, mtd_mac)
+    tu_df, uu_df, mac_tu_df, mac_uu_df = build_filtered(df, mtd_mob_new)
 
     print("[5/8] Building pivot tables …")
     p_cdr      = pivot_cdr(df)
