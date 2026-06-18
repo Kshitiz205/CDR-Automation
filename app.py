@@ -700,18 +700,26 @@ def auto_fit(ws, max_w=45):
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(best + 2, max_w)
 
 
-def load_mtd(master_bytes):
+def load_mtd(master_bytes, cdr_date=None):
     wb = openpyxl.load_workbook(io.BytesIO(master_bytes), data_only=True, read_only=True)
     mtd_mob = set()
+    mtd_mob_new = set()  # keys dated exactly on cdr_date = new users today
     if "MTD(Mobile No.)" in wb.sheetnames:
         for row in wb["MTD(Mobile No.)"].iter_rows(min_row=2, values_only=True):
-            if row[1]: mtd_mob.add(str(row[1]).strip())
+            if row[1]:
+                key = str(row[1]).strip()
+                mtd_mob.add(key)
+                if cdr_date is not None and row[0] is not None:
+                    dt = row[0]
+                    row_date = dt.date() if isinstance(dt, datetime) else dt
+                    if row_date == cdr_date:
+                        mtd_mob_new.add(key)
     mtd_mac = set()
     if "MTD(MAC)" in wb.sheetnames:
         for row in wb["MTD(MAC)"].iter_rows(min_row=2, values_only=True):
             if row[1]: mtd_mac.add(str(row[1]).strip())
     wb.close()
-    return mtd_mob, mtd_mac
+    return mtd_mob, mtd_mac, mtd_mob_new
 
 
 def load_and_enrich(input_bytes):
@@ -738,15 +746,18 @@ def load_and_enrich(input_bytes):
     return df, cdr_date
 
 
-def build_filtered(df, mtd_mob, mtd_mac):
+def build_filtered(df, mtd_mob_new):
+    # TU = last session per Mobile+BTS
     tu_mask     = ~df.duplicated(subset="abc", keep="last")
     tu_df       = df[tu_mask][RAW_COLS].sort_values(["BT Site ID","Session Start"]).reset_index(drop=True)
-    uu_mask     = tu_mask & ~df["abc"].isin(mtd_mob)
+    # UU = TU rows whose abc key is dated TODAY in MTD (new users first seen today)
+    uu_mask     = tu_mask & df["abc"].isin(mtd_mob_new)
     uu_df       = df[uu_mask][RAW_COLS+["abc"]].sort_values(["BT Site ID","Session Start"]).reset_index(drop=True)
+    # MAC TU = last session per MAC+BTS
     mac_tu_mask = ~df.duplicated(subset="efg", keep="last")
     mac_tu_df   = df[mac_tu_mask][RAW_COLS].sort_values(["BT Site ID","Session Start"]).reset_index(drop=True)
-    mac_uu_mask = mac_tu_mask & ~df["efg"].isin(mtd_mac)
-    mac_uu_df   = df[mac_uu_mask][RAW_COLS+["efg"]].sort_values(["BT Site ID","Session Start"]).reset_index(drop=True)
+    # MAC UU = MAC TU (no MTD filter for MAC - verified against manual report)
+    mac_uu_df   = df[mac_tu_mask][RAW_COLS+["efg"]].sort_values(["BT Site ID","Session Start"]).reset_index(drop=True)
     return tu_df, uu_df, mac_tu_df, mac_uu_df
 
 
@@ -877,16 +888,17 @@ def write_cdr_date_sheet(wb, name, df, mtd_mob, mtd_mac):
 
 
 def generate_cdr(input_bytes, master_bytes, progress_cb, status_cb):
-    status_cb("loading_mtd")
-    mtd_mob, mtd_mac = load_mtd(master_bytes)
-    progress_cb(15)
-
+    # Load input first to get cdr_date, then load MTD with date context
     status_cb("loading_input")
     df, cdr_date = load_and_enrich(input_bytes)
+    progress_cb(15)
+
+    status_cb("loading_mtd")
+    mtd_mob, mtd_mac, mtd_mob_new = load_mtd(master_bytes, cdr_date)
     progress_cb(30)
 
     status_cb("filtering")
-    tu_df, uu_df, mac_tu_df, mac_uu_df = build_filtered(df, mtd_mob, mtd_mac)
+    tu_df, uu_df, mac_tu_df, mac_uu_df = build_filtered(df, mtd_mob_new)
     progress_cb(45)
 
     status_cb("pivots")
